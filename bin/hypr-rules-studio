@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 USAGE = "Usage: hypr-rules-studio <command> [id|address]"
 PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COLLECT_TIMEOUT = 15.0
