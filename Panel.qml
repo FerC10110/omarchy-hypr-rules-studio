@@ -155,7 +155,7 @@ Panel {
   }
 
   function doSaveRule(fields) {
-    engineCall(["save-rule"], JSON.stringify(fields), function(payload) {
+    engineCall(["save-rule"], fields, function(payload) {
       if (!payload || payload.error !== undefined) return
       mine = payload.rules || []
       editingRule = null
@@ -167,7 +167,7 @@ Panel {
 
   function previewRule(props) {
     if (selectedAddress === "") return
-    engineCall(["preview", selectedAddress], JSON.stringify({ "props": props }), function(payload) {
+    engineCall(["preview", selectedAddress], { "props": props }, function(payload) {
       // An engine error already reaches the notice through finishEngine
       // (in urgent color); this only has to describe a payload that came
       // back clean but did, or didn't, actually change anything.
@@ -215,7 +215,12 @@ Panel {
   function showNotice(text, isError) {
     notice = text
     noticeIsError = isError === true
-    noticeTimer.restart()
+    // An error is the only account the panel can give of a failure, and it
+    // arrives when you are looking at the window, not at the notice. Five
+    // seconds was not enough to read one: errors now stay until the next
+    // notice replaces them. Confirmations still clear themselves.
+    if (noticeIsError) noticeTimer.stop()
+    else noticeTimer.restart()
   }
 
   function checkHealth() {
@@ -267,7 +272,7 @@ Panel {
   // the check runs once at startup and again whenever the panel is opened.
   Component.onCompleted: checkHealth()
 
-  Timer { id: noticeTimer; interval: 5000; onTriggered: studio.notice = "" }
+  Timer { id: noticeTimer; interval: 9000; onTriggered: studio.notice = "" }
 
   // ---- engine: one Process for every call, one call in flight, a queue of
   // pending calls. Copied from Runbook's Panel.qml verbatim.
