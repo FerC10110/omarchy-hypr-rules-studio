@@ -1,0 +1,853 @@
+#!/usr/bin/python3
+"""Hypr Rules Studio engine: reads the Hyprland window rules, says which ones
+apply to a window, writes the user's own rules, and checks the config.
+
+Every subcommand prints one JSON document on stdout. Errors of our own print
+{"error": "..."} and exit 1. Data from the panel arrives as one JSON line on
+stdin; only ids and window addresses travel as arguments.
+"""
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import tempfile
+import time
+
+VERSION = "1.0.0"
+USAGE = "Usage: hypr-rules-studio <command> [id|address]"
+PLUGIN_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+COLLECT_TIMEOUT = 15.0
+HYPRCTL_TIMEOUT = 5.0
+
+STORE_VERSION = 1
+MATCH_FIELDS = ("class", "title", "initial_class", "initial_title")
+# What the Editor can set. Everything else is Hyprland's business, not ours.
+PROP_TYPES = {"float": bool, "pin": bool, "no_focus": bool, "tile": bool,
+              "size": list, "move": list, "workspace": str, "opacity": str,
+              "tag": str, "center": bool}
+TEXT_MAX = 256
+# Newlines (and other control bytes) in a match/prop string would land verbatim
+# inside a Lua "..." literal and break the syntax of the file hyprland.lua
+# requires; refused up front, and escaped again in lua_value as a second line
+# of defense for anything that reaches render_lua some other way.
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
+# Hyprland's opacity windowrule takes one to three numbers (active [inactive
+# [fullscreen]]); anything else (a stray "auto", a typo) is refused here so
+# it never gets the chance to save clean and fail later as a hyprland-error
+# the Doctor has to explain after the fact.
+OPACITY_RE = re.compile(r"^\d+(\.\d+)?(\s+\d+(\.\d+)?){0,2}$")
+REQUIRE_LINE = 'require("hypr.rules-studio")'
+REQUIRE_COMMENT = "-- Load the rules you made in Hypr Rules Studio."
+MARK_START = "-- >>> hypr-rules-studio (managed) — edit it from the panel"
+MARK_END = "-- <<< hypr-rules-studio"
+
+
+class StudioError(Exception):
+    """An error we report to the panel as {"error": message}."""
+
+
+def fail(message):
+    raise StudioError(message)
+
+
+def emit(stdout, payload):
+    json.dump(payload, stdout)
+    stdout.write("\n")
+
+
+def read_stdin_json(stdin):
+    """The panel sends exactly one JSON line; no line means an empty document."""
+    line = stdin.readline()
+    if not line.strip():
+        return {}
+    try:
+        value = json.loads(line)
+    except ValueError:
+        fail("The panel sent invalid JSON")
+    if not isinstance(value, dict):
+        fail("The panel sent something that is not an object")
+    return value
+
+
+def config_path(environ):
+    return os.path.join(environ.get("HOME", ""), ".config", "hypr", "hyprland.lua")
+
+
+def lua_bin(environ):
+    """Lua ships as a dependency of hyprland, so it is there; an override helps tests."""
+    return environ.get("STUDIO_LUA") or "/usr/bin/lua"
+
+
+def rules_file(environ):
+    return os.path.join(environ.get("HOME", ""), ".config", "hypr", "rules-studio.lua")
+
+
+def classify(path, environ):
+    """Where a rule comes from, for the panel's badge."""
+    if path == rules_file(environ):
+        return "studio"
+    omarchy = environ.get("OMARCHY_PATH") or "/usr/share/omarchy"
+    if path.startswith(os.path.join(omarchy, "default")):
+        return "omarchy"
+    if "/themes/" in path or path.startswith(os.path.join(environ.get("HOME", ""), ".config", "omarchy")):
+        return "theme"
+    return "user"
+
+
+# ===== collecting =====
+
+def collect_rules(environ, run):
+    """Run the user's Hyprland config with a stubbed hl and read back its rules.
+
+    Never raises: a config that does not load is a result with an error, which
+    is exactly what the Doctor shows. `run(..., text=True)` can fail in more
+    ways than OSError/TimeoutExpired (a config whose stdout is not valid
+    UTF-8 raises UnicodeDecodeError, for one) - broad on purpose, so this
+    promise actually holds instead of just reading like it does.
+    """
+    script = os.path.join(PLUGIN_DIR, "lib", "collect.lua")
+    config = config_path(environ)
+    if not os.path.isfile(config):
+        return {"rules": [], "error": "No Hyprland config at " + config}
+    try:
+        done = run([lua_bin(environ), script, config], capture_output=True, text=True,
+                   timeout=COLLECT_TIMEOUT, env=dict(environ))
+    except subprocess.TimeoutExpired:
+        return {"rules": [], "error": "Reading the config took too long"}
+    except Exception as error:
+        return {"rules": [], "error": "Could not run lua: " + str(error)}
+    if done.returncode != 0:
+        return {"rules": [], "error": (done.stderr or "lua failed").strip()}
+    try:
+        payload = json.loads(done.stdout)
+    except ValueError:
+        return {"rules": [], "error": "The collector returned no JSON"}
+    for rule in payload.get("rules", []):
+        rule["source"] = classify(rule.get("file", ""), environ)
+    return {"rules": payload.get("rules", []), "error": payload.get("error")}
+
+
+def hyprctl_json(args, run, environ):
+    """Run hyprctl and parse its JSON, turning every failure into our error."""
+    argv = ["hyprctl", "-j"] + args
+    try:
+        done = run(argv, capture_output=True, text=True, timeout=HYPRCTL_TIMEOUT, env=dict(environ))
+    except OSError as error:
+        fail("Could not run hyprctl: " + str(error))
+    except subprocess.TimeoutExpired:
+        fail("hyprctl did not answer")
+    if done.returncode != 0:
+        fail("hyprctl failed: " + (done.stderr or "").strip())
+    try:
+        return json.loads(done.stdout)
+    except ValueError:
+        fail("hyprctl returned no JSON")
+
+
+def _window(raw):
+    workspace = raw.get("workspace") or {}
+    return {
+        "address": raw.get("address", ""),
+        "class": raw.get("class", ""),
+        "title": raw.get("title", ""),
+        "initialClass": raw.get("initialClass", ""),
+        "initialTitle": raw.get("initialTitle", ""),
+        # hyprctl marks rule-applied tags with a trailing "*"; rules name them without it.
+        "tags": [tag.rstrip("*") for tag in raw.get("tags", []) or []],
+        "workspace": str(workspace.get("name", workspace.get("id", ""))),
+        "floating": bool(raw.get("floating")),
+        "pinned": bool(raw.get("pinned")),
+        "fullscreen": bool(raw.get("fullscreen")),
+        "xwayland": bool(raw.get("xwayland")),
+    }
+
+
+def list_windows(environ, run):
+    clients = hyprctl_json(["clients"], run, environ)
+    if not isinstance(clients, list):
+        fail("hyprctl returned no window list")
+    windows = [_window(raw) for raw in clients if raw.get("mapped", True)]
+    windows.sort(key=lambda w: (w["workspace"], w["class"], w["title"]))
+    return {"windows": windows}
+
+
+def find_window(environ, run, address):
+    for window in list_windows(environ, run)["windows"]:
+        if window["address"] == address:
+            return window
+    fail("That window is gone")
+
+
+# Match fields we can evaluate. Hyprland has more (content_type, focus, group…);
+# a rule using one of those is reported as "maybe" instead of guessed at.
+TEXT_FIELDS = {"class": "class", "title": "title",
+               "initial_class": "initialClass", "initial_title": "initialTitle",
+               "initialclass": "initialClass", "initialtitle": "initialTitle"}
+BOOL_FIELDS = {"float": "floating", "floating": "floating", "pin": "pinned",
+               "pinned": "pinned", "fullscreen": "fullscreen", "xwayland": "xwayland"}
+
+
+# ===== resolving =====
+
+def matches(rule_match, state):
+    """Does this rule's match hold for this window state?
+
+    Returns (applies, certain). Hyprland's regexes are ECMAScript and ours are
+    Python's; when we cannot be sure we say so instead of inventing a verdict.
+    """
+    certain = True
+    for field, wanted in (rule_match or {}).items():
+        key = str(field).lower()
+        if key in TEXT_FIELDS:
+            haystack = str(state.get(TEXT_FIELDS[key], ""))
+            try:
+                if re.search(str(wanted), haystack) is None:
+                    return False, certain
+            except re.error:
+                certain = False           # cannot compile it: assume it applies, flag it
+        elif key in BOOL_FIELDS:
+            if bool(state.get(BOOL_FIELDS[key])) != bool(wanted):
+                return False, certain
+        elif key == "tag":
+            if str(wanted).lstrip("+-") not in state.get("tags", []):
+                return False, certain
+        elif key == "workspace":
+            if str(wanted) != str(state.get("workspace", "")):
+                return False, certain
+        else:
+            certain = False               # a field we do not model
+    return True, certain
+
+
+def apply_tags(props, tags):
+    """A rule's `tag` adds (+) or removes (-) a tag for the rules that follow."""
+    value = props.get("tag")
+    if not isinstance(value, str) or value == "":
+        return list(tags)
+    name, sign = value.lstrip("+-"), value[0]
+    out = [tag for tag in tags if tag != name]
+    if sign != "-":
+        out.append(name)
+    return out
+
+
+def prop_value_text(value):
+    """How one property's value reads in a one-line summary."""
+    if isinstance(value, list):
+        return "x".join(str(item) for item in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def props_text(props):
+    """One line for the panel: `float=true size=600x338 opacity=1 1`."""
+    return " ".join("%s=%s" % (key, prop_value_text(props[key])) for key in sorted(props))
+
+
+def resolve(rules, window):
+    """Walk the rules in config order, simulating tags, and say what applies."""
+    state = dict(window)
+    state["tags"] = []
+    applied, effective = [], {}
+    for rule in rules:
+        hit, certain = matches(rule.get("match"), state)
+        if not hit:
+            continue
+        entry = dict(rule)
+        entry["certain"] = certain
+        entry["props_text"] = props_text(rule.get("props") or {})
+        applied.append(entry)
+        state["tags"] = apply_tags(rule.get("props", {}), state["tags"])
+        for prop, value in (rule.get("props") or {}).items():
+            if prop == "tag":
+                continue
+            effective[prop] = {"value": value, "index": rule.get("index"),
+                               "file": rule.get("file"), "line": rule.get("line"),
+                               "source": rule.get("source"), "certain": certain,
+                               # The Inspector's "What you end up with" block
+                               # renders this straight, one row per key: the
+                               # engine supplies the display string, not QML.
+                               "text": "%s=%s" % (prop, prop_value_text(value))}
+    actual = list(window.get("tags", []))
+    return {"applied": applied, "effective": effective,
+            "tags": {"simulated": state["tags"], "actual": actual,
+                     "mismatch": sorted(state["tags"]) != sorted(actual)}}
+
+
+# ===== storing =====
+
+def store_path(environ):
+    return os.path.join(environ.get("HOME", ""), ".config", "hypr-rules-studio", "rules.json")
+
+
+def load_store(environ):
+    """Our rules live in JSON; the Lua file is generated from it, never parsed."""
+    try:
+        with open(store_path(environ)) as handle:
+            store = json.load(handle)
+    except FileNotFoundError:
+        return {"version": STORE_VERSION, "rules": []}
+    except (ValueError, OSError) as error:
+        fail("Could not read your rules: " + str(error))
+    if not isinstance(store, dict) or not isinstance(store.get("rules"), list):
+        fail("Your rules file is not in the expected shape")
+    # A hand-edited rules.json missing "version" is data, not a crash: heal
+    # it here so with_props_text (and anything else that reads it) never has
+    # to index a key that might not be there.
+    if not isinstance(store.get("version"), int):
+        store["version"] = STORE_VERSION
+    return store
+
+
+def write_atomic(path, text):
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        handle, temp = tempfile.mkstemp(dir=directory)
+    except OSError as error:
+        fail("Could not write " + path + ": " + str(error))
+    try:
+        with os.fdopen(handle, "w") as out:
+            out.write(text)
+        os.chmod(temp, 0o600)
+        os.replace(temp, path)
+    except OSError as error:
+        os.unlink(temp)
+        fail("Could not write " + path + ": " + str(error))
+
+
+def save_store(environ, store):
+    write_atomic(store_path(environ), json.dumps(store, indent=2) + "\n")
+
+
+def validate_rule(fields):
+    """The panel's form, checked before anything reaches the config."""
+    match = fields.get("match")
+    if not isinstance(match, dict) or not match:
+        fail("Pick at least one thing to match on")
+    clean_match = {}
+    for key, value in match.items():
+        if key not in MATCH_FIELDS:
+            fail("Cannot match on " + str(key))
+        if not isinstance(value, str) or value == "" or len(value) > TEXT_MAX:
+            fail("The value for " + key + " is empty or too long")
+        if CONTROL_CHARS.search(value):
+            fail("The value for " + key + " cannot contain control characters")
+        try:
+            re.compile(value)
+        except re.error as error:
+            fail("That is not a valid expression: " + str(error))
+        clean_match[key] = value
+    props = fields.get("props")
+    if not isinstance(props, dict) or not props:
+        fail("Pick at least one thing to change")
+    clean_props = {}
+    for key, value in props.items():
+        expected = PROP_TYPES.get(key)
+        if expected is None:
+            fail("Cannot set " + str(key))
+        if expected is bool and not isinstance(value, bool):
+            fail(key + " must be true or false")
+        if expected is str and (not isinstance(value, str) or len(value) > TEXT_MAX):
+            fail(key + " must be a short piece of text")
+        if expected is str and CONTROL_CHARS.search(value):
+            fail(key + " cannot contain control characters")
+        if key == "opacity" and not OPACITY_RE.match(value):
+            fail("opacity must be one to three numbers, like 0.9 or 0.9 0.6")
+        if expected is list:
+            if (not isinstance(value, list) or len(value) != 2
+                    or not all(isinstance(item, int) for item in value)):
+                fail(key + " must be two whole numbers")
+        clean_props[key] = value
+    comment = fields.get("comment", "")
+    if not isinstance(comment, str) or len(comment) > TEXT_MAX:
+        fail("The note is too long")
+    if CONTROL_CHARS.search(comment):
+        fail("The note cannot contain control characters")
+    return {"match": clean_match, "props": clean_props, "comment": comment}
+
+
+def lua_escape(text):
+    """Escape backslashes, quotes and control bytes so the result is always
+    a valid single-line Lua string literal, whatever validate_rule let through."""
+    out = []
+    for char in text.replace("\\", "\\\\").replace('"', '\\"'):
+        if char == "\n":
+            out.append("\\n")
+        elif char == "\r":
+            out.append("\\r")
+        elif char == "\t":
+            out.append("\\t")
+        elif ord(char) < 0x20 or ord(char) == 0x7f:
+            # Zero-padded to exactly three digits: Lua's \ddd escape reads up
+            # to three decimal digits, so an unpadded one could swallow a
+            # literal digit that happens to follow it in the string.
+            out.append("\\%03d" % ord(char))
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def lua_value(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "{ " + ", ".join(lua_value(item) for item in value) + " }"
+    return '"' + lua_escape(str(value)) + '"'
+
+
+def render_lua(store):
+    lines = ["-- Generated by Hypr Rules Studio. Your edits between the markers are overwritten.",
+             MARK_START]
+    for rule in store["rules"]:
+        if rule.get("comment"):
+            # A raw "-- " comment line, not a quoted string: lua_escape's
+            # backslash escapes would show up as literal text here, so any
+            # control byte (newline, carriage return, ...) is neutralized to
+            # a space instead, same as validate_rule refuses them up front.
+            lines.append("-- " + CONTROL_CHARS.sub(" ", rule["comment"]))
+        match = ", ".join("%s = %s" % (key, lua_value(value))
+                          for key, value in sorted(rule["match"].items()))
+        props = ", ".join("%s = %s" % (key, lua_value(value))
+                          for key, value in sorted(rule["props"].items()))
+        lines.append("o.window({ %s }, { %s })" % (match, props))
+    lines.append(MARK_END)
+    return "\n".join(lines) + "\n"
+
+
+def backup_config(path, text):
+    """Copy the config aside before touching it. Nanosecond-resolution so two
+    backups taken inside the same wall-clock second (purge, then an
+    immediate re-save) still get distinct filenames instead of one silently
+    overwriting the other."""
+    backup = "%s.bak.%d" % (path, time.time_ns())
+    write_atomic(backup, text)
+    os.chmod(backup, 0o644)
+    return backup
+
+
+def ensure_require(environ):
+    """Add the one line that loads our file, backing the config up each time
+    the require line has to be (re-)added - not just the first time ever:
+    a purge followed by a later save adds it again, and backs it up again."""
+    path = config_path(environ)
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except OSError as error:
+        fail("Could not read your Hyprland config: " + str(error))
+    if REQUIRE_LINE in text:
+        return False
+    backup_config(path, text)
+    suffix = "" if text.endswith("\n") else "\n"
+    write_atomic(path, text + suffix + "\n" + REQUIRE_COMMENT + "\n"
+                 + REQUIRE_LINE + "\n")
+    os.chmod(path, 0o644)
+    return True
+
+
+def write_rules_file(environ):
+    store = load_store(environ)
+    write_atomic(rules_file(environ), render_lua(store))
+    os.chmod(rules_file(environ), 0o644)
+    ensure_require(environ)
+    return store
+
+
+def add_rule(environ, fields):
+    store = load_store(environ)
+    rule = validate_rule(fields)
+    rule["id"] = secrets.token_hex(16)
+    store["rules"].append(rule)
+    save_store(environ, store)
+    write_rules_file(environ)
+    return rule
+
+
+def remove_rule(environ, rule_id):
+    store = load_store(environ)
+    kept = [rule for rule in store["rules"] if rule.get("id") != rule_id]
+    if len(kept) == len(store["rules"]):
+        fail("No such rule")
+    store["rules"] = kept
+    save_store(environ, store)
+    write_rules_file(environ)
+
+
+def purge(environ):
+    """Undo everything this plugin wrote, backing up the config before the
+    rewrite (on top of whatever backup ensure_require already made)."""
+    save_store(environ, {"version": STORE_VERSION, "rules": []})
+    try:
+        os.unlink(rules_file(environ))
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        fail("Could not remove the rules file: " + str(error))
+    path = config_path(environ)
+    try:
+        with open(path) as handle:
+            lines = handle.readlines()
+    except OSError as error:
+        fail("Could not read your Hyprland config: " + str(error))
+    # Exact-match on the stripped line, not a substring test: a user's own
+    # comment that merely mentions the require text (e.g. "-- I decided not
+    # to use require(\"hypr.rules-studio\") here") must survive purge.
+    kept = [line for line in lines
+            if line.strip() != REQUIRE_LINE and line.strip() != REQUIRE_COMMENT]
+    if len(kept) != len(lines):
+        # ensure_require appends exactly one blank line ahead of its own
+        # block each time it runs; strip only that single line, not every
+        # blank line left at the tail, so a trailing blank line the user's
+        # own config already had survives purge untouched.
+        if kept and kept[-1].strip() == "":
+            kept.pop()
+        backup_config(path, "".join(lines))
+        write_atomic(path, "".join(kept))
+        os.chmod(path, 0o644)
+
+
+# ===== previewing =====
+
+# Properties we can try on a live window, in the order Hyprland needs them:
+# a window has to float before resizing or moving it means anything.
+PREVIEW_ORDER = ("float", "tile", "workspace", "size", "move", "pin", "opacity", "center")
+
+
+def hyprctl_eval(lua_code, run, environ):
+    """Run one Lua statement through Hyprland's own `hyprctl eval`.
+
+    This Hyprland build ships native Lua config/scripting (see
+    /usr/share/hypr/stubs/hl.meta.lua on the machine it runs on): `hyprctl
+    dispatch <text>` is not the classic "dispatcher argstring" wire protocol
+    here, it evaluates `return hl.dispatch(<text>)` as Lua, and the classic
+    dispatcher names ("setfloating", "movewindowpixel", ...) are not valid
+    Lua and are rejected outright ("hl.dispatch: expected a dispatcher").
+    So this writes the Lua directly, the same way any other script talking
+    to this Hyprland would, instead of a text protocol that no longer
+    applies. `hl.get_window(...)` objects are read-only ("attempt to modify
+    read-only hl object" if you try `w.floating = true`), so every change
+    still goes through `hl.dispatch(hl.dsp.window.*(...))`, whose argument
+    shapes aren't in the stub (typed as `...`) and were found by triggering
+    Hyprland's own validation errors against a throwaway test window.
+    """
+    argv = ["hyprctl", "eval", lua_code]
+    try:
+        done = run(argv, capture_output=True, text=True, timeout=HYPRCTL_TIMEOUT, env=dict(environ))
+    except OSError as error:
+        fail("Could not run hyprctl: " + str(error))
+    except subprocess.TimeoutExpired:
+        fail("hyprctl did not answer")
+    if done.returncode != 0:
+        # hyprctl eval prints its "error: ..." to stdout, not stderr.
+        fail("hyprctl failed: " + (done.stdout or done.stderr or "").strip())
+    return (done.stdout or "").strip()
+
+
+def _preview_opacity_literal(value):
+    """The first whitespace-separated token of an opacity string, as a Lua
+    number literal, or None if it cannot be previewed live.
+
+    `hl.dsp.window.set_prop`'s "opacity" prop takes one plain number; the
+    saved rule's classic "active inactive" two-value form (see render_lua)
+    can only be previewed as its first value, and anything that is not a
+    plain, finite number (not NaN/±inf, which have no Lua literal spelling)
+    is reported as skipped rather than guessed at.
+    """
+    parts = str(value).split()
+    if not parts:
+        return None
+    try:
+        number = float(parts[0])
+    except ValueError:
+        return None
+    if number != number or number in (float("inf"), float("-inf")):  # NaN, ±inf
+        return None
+    return repr(number)
+
+
+def preview_props(environ, run, address, props):
+    """Apply the rule's effect to this one live window, so the user can see it.
+
+    Nothing is written to disk: this is Hyprland doing it once, by hand. Each
+    property is tried on its own - one failing partway through (a rejected
+    value, hyprctl timing out) must not erase what the properties tried
+    before it already did to the window, so a failure here goes into
+    `failed` instead of raising out of the loop.
+    """
+    validate_rule({"match": {"class": ".*"}, "props": props})
+    find_window(environ, run, address)
+    selector = lua_value("address:" + address)
+    applied, skipped, failed = [], [], {}
+
+    def toggle(field, dispatcher, desired):
+        # float/pin are toggles in this Lua API, not setters, so the
+        # current state is read first and only flipped if it disagrees
+        # with what the rule wants - this also makes "float: false" and
+        # "pin: false" work live, which the old text-protocol version of
+        # this function could not do for pin.
+        hyprctl_eval(
+            "local w = hl.get_window(%s) if w and w.%s ~= %s then hl.dispatch(hl.dsp.window.%s(%s)) end"
+            % (selector, field, lua_value(bool(desired)), dispatcher, selector), run, environ)
+
+    for key in PREVIEW_ORDER:
+        if key not in props:
+            continue
+        value = props[key]
+        try:
+            if key == "float":
+                toggle("floating", "float", value)
+            elif key == "tile":
+                toggle("floating", "float", not value)
+            elif key == "size":
+                hyprctl_eval("hl.dispatch(hl.dsp.window.resize({ x = %d, y = %d, window = %s }))"
+                             % (value[0], value[1], selector), run, environ)
+            elif key == "move":
+                hyprctl_eval("hl.dispatch(hl.dsp.window.move({ x = %d, y = %d, window = %s }))"
+                             % (value[0], value[1], selector), run, environ)
+            elif key == "pin":
+                toggle("pinned", "pin", value)
+            elif key == "workspace":
+                hyprctl_eval("hl.dispatch(hl.dsp.window.move({ workspace = %s, window = %s }))"
+                             % (lua_value(value), selector), run, environ)
+            elif key == "opacity":
+                literal = _preview_opacity_literal(value)
+                if literal is None:
+                    skipped.append(key)
+                    continue
+                hyprctl_eval('hl.dispatch(hl.dsp.window.set_prop({ window = %s, prop = "opacity", value = %s }))'
+                             % (selector, literal), run, environ)
+            elif key == "center":
+                hyprctl_eval("hl.dispatch(hl.dsp.window.center(%s))" % selector, run, environ)
+        except StudioError as error:
+            failed[key] = str(error)
+            continue
+        applied.append(key)
+    for key in props:
+        if key not in PREVIEW_ORDER and key not in skipped:
+            skipped.append(key)          # no_focus, tag: only Hyprland can do these at map time
+    return {"applied": applied, "skipped": sorted(skipped), "failed": failed}
+
+
+# ===== doctoring =====
+
+def state_path(environ):
+    return os.path.join(environ.get("HOME", ""), ".local", "state", "hypr-rules-studio", "state.json")
+
+
+def read_state(environ):
+    try:
+        with open(state_path(environ)) as handle:
+            state = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_state(environ, state):
+    write_atomic(state_path(environ), json.dumps(state) + "\n")
+
+
+def hyprland_version(environ, run):
+    try:
+        payload = hyprctl_json(["version"], run, environ)
+    except StudioError:
+        return ""
+    return str((payload or {}).get("tag", ""))
+
+
+def find_conflicts(rules):
+    """Our rules that a later rule with the same match overrides.
+
+    Same match and same property is the case we can be sure about, and it is
+    the one that actually happens: you write a rule for an app Omarchy already
+    has an opinion about.
+    """
+    conflicts = []
+    for rule in rules:
+        if rule.get("source") != "studio":
+            continue
+        for later in rules:
+            if later.get("index", 0) <= rule.get("index", 0):
+                continue
+            if later.get("match") != rule.get("match"):
+                continue
+            for prop in rule.get("props", {}):
+                if prop in later.get("props", {}):
+                    conflicts.append({"prop": prop, "rule": rule, "winner": later})
+    return conflicts
+
+
+def doctor(environ, run):
+    """Everything that can be wrong, in the order the user should care about.
+
+    Collecting the rules always runs the real lua binary, never the injected
+    `run`: it is what interprets the user's own config, so there is no
+    meaningful way to fake its output for an arbitrary file the way a plain
+    hyprctl JSON answer can be faked (collect_rules is exercised the same way
+    in test_collect.py, against real fixtures). `run` here is for asking
+    Hyprland itself how it is doing.
+    """
+    problems = []
+    # Deliberately the real subprocess.run, not the injected `run`: collect_rules'
+    # argv embeds config_path(environ), which a static FakeRun answers dict can
+    # never match, and this is the one call that must really execute lua to be
+    # worth anything. `run` below is only for asking Hyprland itself how it is
+    # doing (hyprctl), which is realistically fakeable with plain JSON answers.
+    collected = collect_rules(environ, subprocess.run)
+    if collected["error"]:
+        problems.append({"kind": "config-error",
+                         "title": "Your Hyprland config does not load",
+                         "detail": collected["error"]})
+    try:
+        errors = hyprctl_json(["configerrors"], run, environ) or []
+    except StudioError as error:
+        errors = []
+        problems.append({"kind": "no-hyprland",
+                         "title": "I cannot ask Hyprland how it is doing",
+                         "detail": str(error)})
+    for message in errors:
+        # A healthy Hyprland still answers `configerrors` with a list holding
+        # one blank string, not an empty list: that is its "no errors", not
+        # an error with nothing to say.
+        if not str(message).strip():
+            continue
+        problems.append({"kind": "hyprland-error",
+                         "title": "Hyprland reported a config error",
+                         "detail": str(message)})
+    state_error = False
+    try:
+        store = load_store(environ)
+    except StudioError as error:
+        store = {"version": STORE_VERSION, "rules": []}
+        state_error = True
+        problems.append({"kind": "state-error",
+                         "title": "I could not read your saved rules",
+                         "detail": str(error)})
+    if store["rules"]:
+        try:
+            with open(config_path(environ)) as handle:
+                loaded = REQUIRE_LINE in handle.read()
+        except OSError:
+            loaded = False
+        if not loaded or not os.path.isfile(rules_file(environ)):
+            problems.append({"kind": "not-loaded",
+                             "title": "Your rules are saved but not loaded",
+                             "detail": "Add " + REQUIRE_LINE + " to " + config_path(environ)})
+        else:
+            # The require line and the file both being there is not the same
+            # as the file actually holding what was saved: the process could
+            # have been killed between save_store and write_rules_file, or
+            # rules-studio.lua hand-edited afterwards. Compare content, not
+            # just presence.
+            try:
+                with open(rules_file(environ)) as handle:
+                    current = handle.read()
+            except OSError:
+                current = None
+            if current != render_lua(store):
+                problems.append({"kind": "stale",
+                                 "title": "Your rules are saved but the generated file is out of date",
+                                 "detail": "rules-studio.lua does not match what you saved; save a rule "
+                                            "again, or use \"Remove everything I wrote\" and start over."})
+    for conflict in find_conflicts(collected["rules"]):
+        problems.append({"kind": "overridden",
+                         "title": "Your rule is overridden by a later one",
+                         "detail": "%s is set again at %s:%d" % (
+                             conflict["prop"], conflict["winner"]["file"], conflict["winner"]["line"])})
+    version = hyprland_version(environ, run)
+    state = read_state(environ)
+    healthy = not problems
+    updated = bool(state.get("hyprland")) and version != "" and version != state["hyprland"]
+    if healthy and version:
+        try:
+            write_state(environ, {"hyprland": version, "checked": int(time.time())})
+        except StudioError:
+            pass  # state just goes unrecorded; the report itself is still healthy
+    return {"healthy": healthy, "problems": problems, "hyprland": version,
+            "rule_count": len(store["rules"]), "collected": len(collected["rules"]),
+            "updated_since_last_ok": updated and not healthy,
+            # A corrupt store forces rule_count to 0, which would otherwise
+            # hide the one button that can fix it: the panel shows "Remove
+            # everything I wrote" when either is true.
+            "state_error": state_error}
+
+
+# ===== dispatching =====
+
+def with_props_text(store):
+    """A copy of `store` whose rules also carry `props_text` (Task 9's "My
+    rules" list, same one-line summary `resolve()` already attaches to an
+    applied rule). Derived for the panel only: never persisted, so this
+    never touches the dict `load_store`/`save_store` hand around."""
+    rules = [dict(rule, props_text=props_text(rule.get("props") or {})) for rule in store["rules"]]
+    # load_store always fills "version" in now, but this stays defensive
+    # rather than indexing it unguarded, in case a caller ever hands in a
+    # plain dict it built by hand instead.
+    return {"version": store.get("version", STORE_VERSION), "rules": rules}
+
+
+def dispatch(args, environ, run, stdin):
+    if not args:
+        fail(USAGE)
+    command = args[0]
+    if command == "version":
+        return {"name": "hypr-rules-studio", "version": VERSION}
+    if command == "rules":
+        return collect_rules(environ, run)
+    if command == "windows":
+        return list_windows(environ, run)
+    if command == "explain":
+        if len(args) < 2:
+            fail("Missing window address")
+        window = find_window(environ, run, args[1])
+        collected = collect_rules(environ, run)
+        if collected["error"]:
+            fail(collected["error"])
+        result = resolve(collected["rules"], window)
+        result["window"] = window
+        return result
+    if command == "mine":
+        return with_props_text(load_store(environ))
+    if command == "save-rule":
+        add_rule(environ, read_stdin_json(stdin))
+        return with_props_text(load_store(environ))
+    if command == "remove-rule":
+        if len(args) < 2:
+            fail("Missing rule id")
+        remove_rule(environ, args[1])
+        return with_props_text(load_store(environ))
+    if command == "purge":
+        purge(environ)
+        return with_props_text(load_store(environ))
+    if command == "preview":
+        if len(args) < 2:
+            fail("Missing window address")
+        return preview_props(environ, run, args[1], read_stdin_json(stdin).get("props", {}))
+    if command == "doctor":
+        return doctor(environ, run)
+    fail("Unknown command: " + command)
+
+
+def main(argv, environ=os.environ, run=subprocess.run, stdin=sys.stdin, stdout=sys.stdout):
+    try:
+        emit(stdout, dispatch(list(argv), environ, run, stdin))
+        return 0
+    except StudioError as error:
+        emit(stdout, {"error": str(error)})
+        return 1
+    except Exception as error:
+        # The one promise every subcommand makes is one JSON document on
+        # stdout: a bug we did not anticipate must still end there, not as
+        # an empty stdout and a bare traceback the panel cannot parse.
+        emit(stdout, {"error": "Something went wrong: " + str(error)})
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
